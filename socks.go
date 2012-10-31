@@ -21,44 +21,55 @@ type SocksConn struct {
 	RemotePort uint16
 	Remote     *net.TCPConn
 	RemoteRW   *bufio.Reader
-
-	Quit chan bool
 }
 
 func newSocksConn(con *net.TCPConn) *SocksConn {
 	s := new(SocksConn)
-
 	s.Con = con
-	s.Quit = make(chan bool)
 
 	return s
 }
 
-func handleSocks(in <-chan *net.TCPConn, out chan<- *net.TCPConn) {
+func (s *SocksConn) GetClientAddr() string {
+	if s.Con != nil {
+		return s.Con.RemoteAddr().String()
+	}
 
-	for conn := range in {
+	return "<nil>"
+}
 
-		log.Printf("New client: %s", conn.RemoteAddr().String())
+func (s *SocksConn) GetRemoteAddr() string {
+	if s.Remote != nil {
+		return s.Remote.RemoteAddr().String()
+	}
 
-		s := newSocksConn(conn)
-		proxySocks(s)
-		out <- conn
+	return ""
+}
+
+func (s *SocksConn) SocksLog(msg string) {
+	if s.GetRemoteAddr() == "" {
+		log.Printf("%s: %s", s.GetClientAddr(), msg)
+	} else {
+		log.Printf("%s -> %s: %s", s.GetClientAddr(), s.GetRemoteAddr(), msg)
 	}
 }
 
-func proxySocks(s *SocksConn) {
+func (s *SocksConn) ProxySocks() {
 
 	// setup connection via socks4 protocol
 	if s.Setup() != 0 {
+		s.SocksLog("Setup() failed")
 		return
 	}
 
 	if s.Dial() != 0 {
+		s.SocksLog("Dial() failed")
 		return
 	}
 
 	s.Loop()
-
+	
+	s.SocksLog("done")
 }
 
 // sets up connection according to socks4
@@ -104,7 +115,11 @@ func (c *SocksConn) Setup() int {
 	c.RemoteIP = ip
 	c.RemotePort = dstport
 
-	log.Printf("Ver: %X Cmd: %X Port: %d IP: %v User: %s", vn, cd, dstport, ip, user)
+	c.SocksLog(fmt.Sprintf("Ver %X Cmd: %X Port: %d IP: %v User: %s", vn, cd, dstport, ip, user))
+
+	if vn != 4 || cd != 1 {
+		goto error
+	}
 
 	// Reply
 	c.Con.Write([]byte{0, 90, 0, 0, 0, 0, 0, 0})
@@ -128,29 +143,33 @@ func (s *SocksConn) Dial() int {
 
 	rAddr, err := net.ResolveTCPAddr("tcp", remote)
 	if err != nil {
-		log.Printf("Dial(): %s", err.Error())
+		s.SocksLog(fmt.Sprintf("ResolveTCPAddr(): %s", err.Error()))
 		return 1
 	}
 
 	rem, err := net.DialTCP("tcp", nil, rAddr)
 	if err != nil {
-		log.Printf("Dial(): %s", err.Error())
+		s.SocksLog(fmt.Sprintf("DialTCP(): %s", err.Error()))
 		return 1
 	}
 
 	s.Remote = rem
 
-	log.Println("Successfully connected to " + remote)
+	s.SocksLog("Successfully connected to " + remote)
 
 	// FINISH ME
 
 	return 0
 }
 
-func netcopy(to *net.TCPConn, from *net.TCPConn, quit chan<- bool) {
-	_, err := io.Copy(to, from)
-	if err != nil {
-		log.Printf("%s -> %s: %s", to.RemoteAddr().String(), from.RemoteAddr().String(), err.Error())
+func (s *SocksConn) netcopy(to *net.TCPConn, from *net.TCPConn, quit chan<- bool) {
+
+	if _, err := io.Copy(to, from); err != nil {
+		s.SocksLog("Copy(): " + err.Error())
+
+		if err := from.Close(); err != nil {
+			s.SocksLog("Close(): " + err.Error())
+		}
 	}
 
 	quit <- true
@@ -161,15 +180,25 @@ func (s *SocksConn) Loop() {
 	sync := make(chan bool, 2)
 
 	// remote -> client
-	go netcopy(s.Remote, s.Con, sync)
+	go s.netcopy(s.Remote, s.Con, sync)
 
 	// client -> remote
-	go netcopy(s.Con, s.Remote, sync)
+	go s.netcopy(s.Con, s.Remote, sync)
 
 	<-sync
 	<-sync
+}
 
-	log.Printf("Client %s -> %s done", s.Con.RemoteAddr().String(), fmt.Sprintf("%s:%d", s.RemoteIP.String(), s.RemotePort))
+func handleSocks(in <-chan *net.TCPConn, out chan<- *net.TCPConn) {
+
+	for conn := range in {
+		s := newSocksConn(conn)
+
+		s.SocksLog("connected")
+
+		s.ProxySocks()
+		out <- conn
+	}
 }
 
 func handleComplete(in <-chan *net.TCPConn) {
@@ -189,7 +218,7 @@ func main() {
 		log.Fatal(err)
 	}
 
-	log.Println("Listening on " + *listenAddr)
+	log.Println(*listenAddr + " listening")
 
 	pending, complete := make(chan *net.TCPConn), make(chan *net.TCPConn)
 
