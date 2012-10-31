@@ -1,28 +1,28 @@
 package main
 
 import (
+	"bufio"
 	"encoding/binary"
 	"flag"
+	"fmt"
 	"io"
 	"log"
 	"net"
-	"bufio"
-	"fmt"
 )
 
-var listenAddr	*string = flag.String("l", "127.0.0.1:8080", "listening address")
-var goCount	*int = flag.Int("g", 1, "number of goroutine handlers")
+var listenAddr *string = flag.String("l", "127.0.0.1:8080", "listening address")
+var goCount *int = flag.Int("g", 1, "number of goroutine handlers")
 
 type SocksConn struct {
-	Con	*net.TCPConn
-	ConRW	*bufio.Reader
+	Con   *net.TCPConn
+	ConRW *bufio.Reader
 
-	RemoteIP net.IP
+	RemoteIP   net.IP
 	RemotePort uint16
-	Remote	*net.TCPConn
-	RemoteRW *bufio.Reader
+	Remote     *net.TCPConn
+	RemoteRW   *bufio.Reader
 
-	Quit	chan bool
+	Quit chan bool
 }
 
 func newSocksConn(con *net.TCPConn) *SocksConn {
@@ -69,7 +69,7 @@ func (c *SocksConn) Setup() int {
 	var vn, cd uint8
 	var dstport uint16
 	var dstip [4]byte
-	
+
 	var ip net.IP
 	var user string
 
@@ -90,20 +90,19 @@ func (c *SocksConn) Setup() int {
 		goto error
 	}
 
-	c.RemotePort = dstport
-
 	// ip
 	if err = binary.Read(c.ConRW, binary.BigEndian, &dstip); err != nil {
 		goto error
 	}
 
-	ip = net.IPv4(dstip[0], dstip[1], dstip[2], dstip[3])
-	c.RemoteIP = ip
-
 	// user
 	if user, err = c.ConRW.ReadString(0); err != nil {
 		goto error
 	}
+
+	ip = net.IPv4(dstip[0], dstip[1], dstip[2], dstip[3])
+	c.RemoteIP = ip
+	c.RemotePort = dstport
 
 	log.Printf("Ver: %X Cmd: %X Port: %d IP: %v User: %s", vn, cd, dstport, ip, user)
 
@@ -113,6 +112,8 @@ func (c *SocksConn) Setup() int {
 	return 0
 
 error:
+	c.Con.Write([]byte{0, 91, 0, 0, 0, 0, 0, 0})
+
 	if err != nil {
 		log.Println(err)
 	}
@@ -146,10 +147,29 @@ func (s *SocksConn) Dial() int {
 	return 0
 }
 
+func netcopy(to *net.TCPConn, from *net.TCPConn, quit chan<- bool) {
+	_, err := io.Copy(to, from)
+	if err != nil {
+		log.Printf("%s -> %s: %s", to.RemoteAddr().String(), from.RemoteAddr().String(), err.Error())
+	}
+
+	quit <- true
+}
+
 // loops, sending data between remote ends of socks4 proxy.
 func (s *SocksConn) Loop() {
-	go io.Copy(s.Con, s.Remote)
-	io.Copy(s.Remote, s.Con)
+	sync := make(chan bool, 2)
+
+	// remote -> client
+	go netcopy(s.Remote, s.Con, sync)
+
+	// client -> remote
+	go netcopy(s.Con, s.Remote, sync)
+
+	<-sync
+	<-sync
+
+	log.Printf("Client %s -> %s done", s.Con.RemoteAddr().String(), fmt.Sprintf("%s:%d", s.RemoteIP.String(), s.RemotePort))
 }
 
 func handleComplete(in <-chan *net.TCPConn) {
