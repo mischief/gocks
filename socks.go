@@ -8,6 +8,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"errors"
 )
 
 var listenAddr *string = flag.String("l", "127.0.0.1:8080", "listening address")
@@ -57,13 +58,13 @@ func (s *SocksConn) SocksLog(msg string) {
 func (s *SocksConn) ProxySocks() {
 
 	// setup connection via socks4 protocol
-	if s.Setup() != 0 {
-		s.SocksLog("Setup() failed")
+	if err := s.Setup(); err != nil {
+		s.SocksLog("Setup() failed: " + err.Error())
 		return
 	}
 
-	if s.Dial() != 0 {
-		s.SocksLog("Dial() failed")
+	if err := s.Dial(); err != nil {
+		s.SocksLog("Dial() failed:" + err.Error())
 		return
 	}
 
@@ -73,7 +74,7 @@ func (s *SocksConn) ProxySocks() {
 }
 
 // sets up connection according to socks4
-func (c *SocksConn) Setup() int {
+func (c *SocksConn) Setup() error {
 
 	var err error
 
@@ -90,9 +91,19 @@ func (c *SocksConn) Setup() int {
 	if err = binary.Read(c.ConRW, binary.BigEndian, &vn); err != nil {
 		goto error
 	}
+	
+	if vn != 4 {
+		err = errors.New("Setup(): invalid protocol version " + fmt.Sprintf("%d", vn))
+		goto error
+	}
 
 	// command
 	if err = binary.Read(c.ConRW, binary.BigEndian, &cd); err != nil {
+		goto error
+	}
+	
+	if cd != 1 {
+		err = errors.New("Setup(): invalid protocol command " + fmt.Sprintf("%d", cd))
 		goto error
 	}
 
@@ -117,49 +128,41 @@ func (c *SocksConn) Setup() int {
 
 	c.SocksLog(fmt.Sprintf("Ver %X Cmd: %X Port: %d IP: %v User: %s", vn, cd, dstport, ip, user))
 
-	if vn != 4 || cd != 1 {
-		goto error
-	}
-
 	// Reply
 	c.Con.Write([]byte{0, 90, 0, 0, 0, 0, 0, 0})
 
-	return 0
-
+	return nil
+	
 error:
 	c.Con.Write([]byte{0, 91, 0, 0, 0, 0, 0, 0})
 
 	if err != nil {
-		log.Println(err)
+		c.SocksLog("Setup(): " + err.Error())
 	}
 
-	return 1
+	return err
 }
 
 // Dial the remote server.
-func (s *SocksConn) Dial() int {
+func (s *SocksConn) Dial() error {
 
 	remote := fmt.Sprintf("%s:%d", s.RemoteIP.String(), s.RemotePort)
 
 	rAddr, err := net.ResolveTCPAddr("tcp", remote)
 	if err != nil {
-		s.SocksLog(fmt.Sprintf("ResolveTCPAddr(): %s", err.Error()))
-		return 1
+		return err
 	}
 
 	rem, err := net.DialTCP("tcp", nil, rAddr)
 	if err != nil {
-		s.SocksLog(fmt.Sprintf("DialTCP(): %s", err.Error()))
-		return 1
+		return err
 	}
 
 	s.Remote = rem
 
 	s.SocksLog("Successfully connected to " + remote)
 
-	// FINISH ME
-
-	return 0
+	return nil
 }
 
 func (s *SocksConn) netcopy(to *net.TCPConn, from *net.TCPConn, quit chan<- bool) {
@@ -167,9 +170,9 @@ func (s *SocksConn) netcopy(to *net.TCPConn, from *net.TCPConn, quit chan<- bool
 	if _, err := io.Copy(to, from); err != nil {
 		s.SocksLog("Copy(): " + err.Error())
 
-		if err := from.Close(); err != nil {
-			s.SocksLog("Close(): " + err.Error())
-		}
+		//~ if err := from.Close(); err != nil {
+			//~ s.SocksLog("Close(): " + err.Error())
+		//~ }
 	}
 
 	quit <- true
@@ -217,6 +220,8 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
+	
+	defer ln.Close()
 
 	log.Println(*listenAddr + " listening")
 
@@ -227,8 +232,6 @@ func main() {
 	}
 
 	go handleComplete(complete)
-
-	defer ln.Close()
 
 	dead := 0
 
